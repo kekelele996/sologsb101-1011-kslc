@@ -181,6 +181,7 @@ onMounted(() => {
       <StatBadge label="测站" :value="counts.stations ?? 0" suffix="站" icon="Odometer" />
       <StatBadge label="断面测次" :value="counts.sections ?? 0" suffix="次" icon="Files" tone="info" />
       <StatBadge label="流速测点" :value="counts.points ?? 0" suffix="点" icon="DataLine" tone="success" />
+      <StatBadge label="比降观测" :value="counts.slopeObservations ?? 0" suffix="条" icon="Odometer" tone="info" />
       <StatBadge
         label="比测合格率"
         :value="ratingStore.fitQuality.qualifyRatePct"
@@ -290,7 +291,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / slopeObservations 七张表
         </span>
       </div>
 
@@ -334,7 +335,10 @@ onMounted(() => {
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
         </el-descriptions-item>
-        <el-descriptions-item label="最近备份时间">
+        <el-descriptions-item label="比降观测配置">
+          {{ counts.slopeObservations ?? 0 }} 条
+        </el-descriptions-item>
+        <el-descriptions-item label="最近备份时间" :span="3">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>
       </el-descriptions>

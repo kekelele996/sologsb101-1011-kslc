@@ -12,12 +12,14 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { SlopeObservation } from '@/types/slope'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
+import { calcFallM, correctToSteadyFlow, matchSectionForRating, DEFAULT_FALL_INDEX } from '@/types/slope'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +42,7 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  slopeObservations: SlopeObservation[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +52,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  slopeObservations!: Table<SlopeObservation, string>
 
   constructor() {
     super(DB_NAME)
@@ -63,8 +67,18 @@ class HydroGaugeDatabase extends Dexie {
       compares: 'id, ratingId, verdict'
     })
 
+    // v1：初版结构（保留历史数据，仅基础索引）
+    this.version(1).stores({
+      stations: 'id, name, river, sectionCode',
+      sections: 'id, stationId, measureNo, method',
+      verticals: 'id, sectionId, no',
+      points: 'id, verticalId, relativeDepth',
+      ratings: 'id, stationId, lineNo, stageM',
+      compares: 'id, ratingId, verdict'
+    })
+
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -94,6 +108,57 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+      })
+
+    // v3：新增比降观测配置表；测次补比降读数；点据补比降归属与改正（旧数据按测次时间回填，对不上先挂着）
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+        sections: 'id, stationId, measureNo, method, stageM, measuredAt, upStageM, downStageM, slopeObservedAt, updatedAt',
+        verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+        ratings:
+          'id, stationId, lineNo, stageM, flowM3s, measuredFlowM3s, sectionId, slopeObservationId, pendingReview, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+        slopeObservations: 'id, stationId, active, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 迁移：旧点据没有比降归属，按测次时间和水位回填；对不上的先挂着（pendingReview=false 但无 sectionId）
+        const sectionRows = await tx.table('sections').toArray()
+        const observationRows = await tx.table('slopeObservations').toArray()
+        await tx
+          .table('ratings')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            const now = Date.now()
+            if (typeof row.createdAt !== 'number') row.createdAt = now
+            if (typeof row.updatedAt !== 'number') row.updatedAt = now
+            // 实测流量兜底：旧数据 flowM3s 即实测流量
+            if (typeof row.measuredFlowM3s !== 'number') row.measuredFlowM3s = row.flowM3s
+            if (typeof row.pendingReview !== 'boolean') row.pendingReview = false
+            // 已回填过归属的不再重复
+            if (row.sectionId) return
+            const matched = matchSectionForRating(
+              {
+                stationId: String(row.stationId),
+                measuredAt: String(row.measuredAt),
+                stageM: Number(row.stageM),
+                measureNo: row.measureNo ? String(row.measureNo) : undefined
+              },
+              sectionRows as Section[]
+            )
+            if (!matched) return
+            row.sectionId = matched.id
+            const fall = calcFallM(matched.upStageM, matched.downStageM)
+            if (fall !== null) row.fallM = fall
+            const obs = (observationRows as SlopeObservation[]).find(
+              (item) => item.stationId === row.stationId && item.active
+            )
+            if (obs) {
+              row.slopeObservationId = obs.id
+              if (obs.fallIndex) row.fallIndex = obs.fallIndex
+            }
+          })
       })
   }
 }
@@ -155,7 +220,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
-          measuredAt: '2024-06-12T08:30:00.000Z'
+          measuredAt: '2024-06-12T08:30:00.000Z',
+          upStageM: 6.22,
+          downStageM: 5.42,
+          slopeObservedAt: '2024-06-12T08:30:00.000Z'
         },
         {
           id: 'sec_lh_2407',
@@ -164,7 +232,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
-          measuredAt: '2024-07-18T09:10:00.000Z'
+          measuredAt: '2024-07-18T09:10:00.000Z',
+          upStageM: 6.95,
+          downStageM: 6.15,
+          slopeObservedAt: '2024-07-18T09:10:00.000Z'
         }
       ],
       verticals: [
@@ -203,7 +274,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
-          measuredAt: '2024-05-22T07:50:00.000Z'
+          measuredAt: '2024-05-22T07:50:00.000Z',
+          upStageM: 3.68,
+          downStageM: 3.18,
+          slopeObservedAt: '2024-05-22T07:50:00.000Z'
         },
         {
           id: 'sec_qj_2408',
@@ -212,7 +286,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
-          measuredAt: '2024-08-09T06:40:00.000Z'
+          measuredAt: '2024-08-09T06:40:00.000Z',
+          upStageM: 4.86,
+          downStageM: 4.36,
+          slopeObservedAt: '2024-08-09T06:40:00.000Z'
         }
       ],
       verticals: [
@@ -251,7 +328,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
-          measuredAt: '2024-06-20T10:05:00.000Z'
+          measuredAt: '2024-06-20T10:05:00.000Z',
+          upStageM: 6.06,
+          downStageM: 5.36,
+          slopeObservedAt: '2024-06-20T10:05:00.000Z'
         }
       ],
       verticals: [
@@ -270,7 +350,7 @@ export async function seedDemoData(): Promise<void> {
   ]
 
   // 水位流量关系点据：A 线为龙门站主定线，B 线为青矶站定线
-  const ratingSeeds: Array<Omit<Rating, 'createdAt' | 'updatedAt'>> = [
+  const ratingSeeds: Array<Omit<Rating, 'createdAt' | 'updatedAt' | 'measuredFlowM3s' | 'pendingReview'>> = [
     { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
     { id: 'rat_lh_a2', stationId: 'stn_lh01', stageM: 4.52, flowM3s: 138.7, lineNo: 'A', measureNo: '2024-05-002', measuredAt: '2024-05-16T08:00:00.000Z' },
     { id: 'rat_lh_a3', stationId: 'stn_lh01', stageM: 5.42, flowM3s: 217.2, lineNo: 'A', measureNo: '2024-06-001', measuredAt: '2024-06-12T08:30:00.000Z' },
@@ -287,9 +367,40 @@ export async function seedDemoData(): Promise<void> {
     { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
   ]
 
+  // 比降观测配置：每站一条在用配置，参考落差与测次落差一致（改正比≈1，demo 流量保持稳定）
+  const slopeObservationSeeds: Array<Omit<SlopeObservation, 'createdAt' | 'updatedAt'>> = [
+    {
+      id: 'slo_lh',
+      stationId: 'stn_lh01',
+      name: '基本比降观测',
+      refFallM: 0.8,
+      fallIndex: DEFAULT_FALL_INDEX,
+      active: true,
+      remark: '上比降水尺 6.20 m、下比降水尺 5.40 m，稳定落差 0.80 m'
+    },
+    {
+      id: 'slo_qj',
+      stationId: 'stn_qj02',
+      name: '基本比降观测',
+      refFallM: 0.5,
+      fallIndex: DEFAULT_FALL_INDEX,
+      active: true,
+      remark: '小河站，浮标法为主，洪水期加测比降'
+    },
+    {
+      id: 'slo_bs',
+      stationId: 'stn_bs03',
+      name: '基本比降观测',
+      refFallM: 0.7,
+      fallIndex: DEFAULT_FALL_INDEX,
+      active: true,
+      remark: '巡测断面，与龙门站比测'
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.slopeObservations],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
@@ -314,7 +425,36 @@ export async function seedDemoData(): Promise<void> {
           bundle.points.map((point) => ({ ...point, ...stamp(point) }))
         )
       )
-      await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
+      // 比降观测配置入库
+      await db.slopeObservations.bulkPut(
+        slopeObservationSeeds.map((obs) => ({ ...obs, ...stamp(obs) }))
+      )
+
+      // 点据回填比降归属：实测流量即稳定流成果（demo 不做改正），按测次号匹配测次并取落差
+      const seedSections = stationBundles.flatMap((bundle) => bundle.sections)
+      const enrichedRatings: Rating[] = ratingSeeds.map((rating) => {
+        const row: Rating = {
+          ...rating,
+          ...stamp(rating),
+          measuredFlowM3s: rating.flowM3s,
+          pendingReview: false
+        }
+        const matched = seedSections.find(
+          (section) => section.stationId === rating.stationId && section.measureNo === rating.measureNo
+        )
+        if (matched) {
+          row.sectionId = matched.id
+          const fall = calcFallM(matched.upStageM, matched.downStageM)
+          if (fall !== null) row.fallM = fall
+          const obs = slopeObservationSeeds.find((item) => item.stationId === rating.stationId && item.active)
+          if (obs) {
+            row.slopeObservationId = obs.id
+            if (obs.fallIndex) row.fallIndex = obs.fallIndex
+          }
+        }
+        return row
+      })
+      await db.ratings.bulkPut(enrichedRatings)
 
       // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
       const compares: Compare[] = []
@@ -375,7 +515,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.slopeObservations],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +523,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.slopeObservations.clear()
       ])
     }
   )
@@ -397,15 +538,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, slopeObservations] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.slopeObservations.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, slopeObservations }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

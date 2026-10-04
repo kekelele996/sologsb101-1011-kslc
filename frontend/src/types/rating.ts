@@ -5,14 +5,26 @@ export interface Rating {
   stationId: string
   /** 水位（m） */
   stageM: number
-  /** 流量（m³/s） */
+  /** 流量（m³/s）：改正到稳定流后的流量，直接参与定线；无比降归属时等于实测流量 */
   flowM3s: number
+  /** 实测流量（m³/s）：改正前的原始流量，比降观测改动或撤掉后据此重算 */
+  measuredFlowM3s: number
   /** 定线号：同一定线号的点据参与同一组拟合 */
   lineNo: string
   /** 点据来源测次号 */
   measureNo: string
   /** 点据时间 */
   measuredAt: string
+  /** 比降归属：匹配到的断面测次 id（按测次时间和水位核对）；为空表示未匹配（挂着） */
+  sectionId?: string | null
+  /** 采用的落差 ΔZ_测（m）：来自匹配测次的上、下比降水尺读数 */
+  fallM?: number | null
+  /** 采用的比降观测配置 id */
+  slopeObservationId?: string | null
+  /** 采用的落差指数 β */
+  fallIndex?: number | null
+  /** 待复核：比降观测改动或撤掉后，用它改过的点据失效，退回资料室重算；待复核点据不参与定线 */
+  pendingReview: boolean
   createdAt: number
   updatedAt: number
 }

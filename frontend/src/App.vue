@@ -9,6 +9,7 @@ import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@el
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useSlopeStore } from '@/stores/slopeStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const slopeStore = useSlopeStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  slopeStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -37,16 +40,20 @@ const navItems = computed(() => [
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
 
-/** 当前上下文的快捷入口：选中测站 → 断面，选中断面 → 垂线，选中垂线 → 测点 */
+/** 当前上下文的快捷入口：选中测站 → 断面 / 比降，选中断面 → 垂线，选中垂线 → 测点 */
 const contextLinks = computed(() => {
   const links: Array<{ label: string; path: string }> = []
   const stationId = route.params.id as string | undefined
   if (route.path.startsWith('/stations/') && stationId) {
     links.push({ label: '该站断面测次', path: `/stations/${stationId}/sections` })
+    links.push({ label: '该站比降观测', path: `/stations/${stationId}/slope` })
   }
   if (route.path.startsWith('/sections/') && stationId) {
     const section = sectionStore.sectionById(stationId)
-    if (section) links.push({ label: '所属测站断面', path: `/stations/${section.stationId}/sections` })
+    if (section) {
+      links.push({ label: '所属测站断面', path: `/stations/${section.stationId}/sections` })
+      links.push({ label: '该站比降观测', path: `/stations/${section.stationId}/slope` })
+    }
     links.push({ label: '该断面垂线', path: `/sections/${stationId}/verticals` })
   }
   if (route.path.startsWith('/verticals/') && stationId) {

@@ -14,13 +14,16 @@ import DeviationTag from '@/components/common/DeviationTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
+import { useSlopeStore } from '@/stores/slopeStore'
 import { fitPowerCurve, type Rating, type RatingFitResult } from '@/types/rating'
+import { ratingSlopeState } from '@/types/slope'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
+const slopeStore = useSlopeStore()
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -37,10 +40,10 @@ const form = reactive({
 const fit = computed(() => ratingStore.activeFit)
 const lineNos = computed(() => (ratingStore.lineNos.length > 0 ? ratingStore.lineNos : ['A']))
 
-/** 当前定线号下的点据（含曲线流量与残差） */
+/** 当前定线号下的点据（含曲线流量与残差）；待复核点据不参与定线 */
 const pointRows = computed(() =>
   ratingStore.ratings
-    .filter((rating) => rating.lineNo === ratingStore.activeLineNo)
+    .filter((rating) => rating.lineNo === ratingStore.activeLineNo && !rating.pendingReview)
     .sort((a, b) => a.stageM - b.stageM)
     .map((rating) => {
       const predicted = fit.value.valid ? Number((fit.value.a * Math.pow(Math.max(rating.stageM - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
@@ -54,9 +57,17 @@ const pointRows = computed(() =>
         stationName: ratingStore.stationNameOf(rating.stationId),
         predicted,
         residualPct,
-        verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
+        verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格'),
+        slopeState: ratingSlopeState(rating)
       }
     })
+)
+
+/** 待复核点据：比降观测改动或撤掉后失效、退回资料室重算，不参与定线 */
+const pendingReviewRows = computed(() =>
+  ratingStore.ratings
+    .filter((rating) => rating.lineNo === ratingStore.activeLineNo && rating.pendingReview)
+    .sort((a, b) => a.stageM - b.stageM)
 )
 
 const filterModel = computed<FilterModel>(() => ({
@@ -146,9 +157,11 @@ async function submitForm(): Promise<void> {
       stationId: form.stationId,
       stageM: form.stageM,
       flowM3s: form.flowM3s,
+      measuredFlowM3s: form.flowM3s,
       lineNo: form.lineNo.trim() || 'A',
       measureNo: form.measureNo.trim(),
-      measuredAt: form.measuredAt ? new Date(form.measuredAt).toISOString() : new Date().toISOString()
+      measuredAt: form.measuredAt ? new Date(form.measuredAt).toISOString() : new Date().toISOString(),
+      pendingReview: false
     }
     if (editingId.value) {
       await ratingStore.updateRating(editingId.value, payload)
@@ -159,6 +172,8 @@ async function submitForm(): Promise<void> {
     }
     ratingStore.setActiveLine(payload.lineNo)
     dialogVisible.value = false
+    // 按测次时间和水位回填比降归属（对不上的先挂着）
+    await slopeStore.backfillRatings()
     await ratingStore.rebuildCompares(payload.lineNo)
   } finally {
     submitting.value = false
@@ -199,6 +214,55 @@ async function refit(): Promise<void> {
 function handleLineChange(lineNo: string | number | boolean | undefined): void {
   ratingStore.setActiveLine(String(lineNo))
   void ratingStore.rebuildCompares(String(lineNo))
+}
+
+/** 试算落差指数并改正：用该测站带落差的点据率定 β，再重算定线 */
+async function trialFit(): Promise<void> {
+  const stationIds = Array.from(new Set(pointRows.value.map((row) => row.rating.stationId)))
+  if (stationIds.length === 0) {
+    ElMessage.warning('当前定线号下没有可试算的点据')
+    return
+  }
+  const results = await Promise.all(
+    stationIds.map((stationId) => slopeStore.trialFitStation(stationId, ratingStore.activeLineNo))
+  )
+  const first = results[0]
+  if (first.valid) {
+    await ratingStore.rebuildCompares(ratingStore.activeLineNo)
+    ElMessage.success(`${first.message}；已重算定线与比测`)
+  } else {
+    ElMessage.warning(first.message || '落差指数试算失败')
+  }
+}
+
+/** 回填比降归属：按测次时间和水位核对，对不上的先挂着 */
+async function backfill(): Promise<void> {
+  const count = await slopeStore.backfillRatings()
+  if (count > 0) {
+    await ratingStore.rebuildCompares(ratingStore.activeLineNo)
+    ElMessage.success(`已回填 ${count} 条点据的比降归属`)
+  } else {
+    ElMessage.info('没有新的可匹配点据（对不上的先挂着）')
+  }
+}
+
+/** 重算单个待复核点据（资料室自己重来） */
+async function recorrect(ratingId: string): Promise<void> {
+  await slopeStore.recorrectRating(ratingId)
+  await ratingStore.rebuildCompares(ratingStore.activeLineNo)
+  ElMessage.success('点据已按当前比降观测重算')
+}
+
+function slopeStateTagType(state: string): 'success' | 'warning' | 'info' {
+  if (state === 'attributed') return 'success'
+  if (state === 'pending') return 'warning'
+  return 'info'
+}
+
+function slopeStateText(state: string): string {
+  if (state === 'attributed') return '已匹配'
+  if (state === 'pending') return '待复核'
+  return '未匹配'
 }
 
 function handleFilterChange(): void {
@@ -253,6 +317,8 @@ onMounted(() => {
           <el-option v-for="lineNo in lineNos" :key="lineNo" :label="`${lineNo} 线`" :value="lineNo" />
         </el-select>
         <el-button :icon="Refresh" @click="refit">重新定线</el-button>
+        <el-button type="success" plain :icon="TrendCharts" @click="trialFit">试算落差指数</el-button>
+        <el-button :icon="Refresh" @click="backfill">回填比降</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate">新增点据</el-button>
       </div>
     </div>
@@ -320,6 +386,30 @@ onMounted(() => {
       :title="`${fit.lineNo} 线定线有效：Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
     />
 
+    <el-alert
+      v-if="pendingReviewRows.length > 0"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="page__pending"
+      :title="`${pendingReviewRows.length} 条点据待复核：比降观测改动或撤掉后已失效，退回资料室重算（不参与定线）`"
+    >
+      <template #default>
+        <div class="page__pending-list">
+          <el-tag
+            v-for="row in pendingReviewRows"
+            :key="row.id"
+            type="warning"
+            effect="plain"
+            class="page__pending-tag"
+          >
+            {{ row.measureNo || '未标记测次' }} · 水位 {{ row.stageM.toFixed(2) }} m
+            <el-button link type="primary" size="small" @click="recorrect(row.id)">重算</el-button>
+          </el-tag>
+        </div>
+      </template>
+    </el-alert>
+
     <div class="page__grid">
       <EmptyPanel
         v-if="pointRows.length === 0"
@@ -330,38 +420,50 @@ onMounted(() => {
       />
 
       <el-table v-else :data="pointRows" border stripe class="gb-table-compact">
-        <el-table-column label="水位 (m)" width="110" align="right">
+        <el-table-column label="水位 (m)" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.stageM.toFixed(2) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实测流量 (m³/s)" width="150" align="right">
+        <el-table-column label="实测流量 (m³/s)" width="120" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.rating.measuredFlowM3s.toFixed(1) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="改正流量 (m³/s)" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.flowM3s.toFixed(1) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="曲线流量 (m³/s)" width="150" align="right">
+        <el-table-column label="曲线流量 (m³/s)" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.predicted > 0 ? row.predicted.toFixed(1) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="残差" width="200">
+        <el-table-column label="残差" width="170">
           <template #default="{ row }">
             <DeviationTag :deviation-pct="row.residualPct" :verdict="row.verdict" :limit="ratingStore.deviationLimitPct" />
           </template>
         </el-table-column>
-        <el-table-column label="测站 / 测次" min-width="180">
+        <el-table-column label="比降归属" width="100" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" :type="slopeStateTagType(row.slopeState)" effect="plain">
+              {{ slopeStateText(row.slopeState) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="测站 / 测次" min-width="170">
           <template #default="{ row }">
             <div>{{ row.stationName }}</div>
             <div class="gb-hint gb-mono">{{ row.rating.measureNo || '未标记测次' }}</div>
           </template>
         </el-table-column>
-        <el-table-column label="点据时间" width="170">
+        <el-table-column label="点据时间" width="150">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.rating.measuredAt).toLocaleDateString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="140" fixed="right">
           <template #default="{ row }">
             <el-button size="small" :icon="Edit" @click="openEdit(row.rating)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeRating(row.rating)">删除</el-button>
@@ -487,6 +589,23 @@ onMounted(() => {
 
 .page__full {
   width: 100%;
+}
+
+.page__pending {
+  margin-top: 4px;
+}
+
+.page__pending-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.page__pending-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 @media (max-width: 1180px) {

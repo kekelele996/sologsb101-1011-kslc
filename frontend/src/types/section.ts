@@ -18,6 +18,12 @@ export interface Section {
   method: MeasureMethod
   /** 测流时间 */
   measuredAt: string
+  /** 上比降水尺读数（m）：巡测班补记的往返比降，与下比降水尺读数共同计算落差 */
+  upStageM?: number | null
+  /** 下比降水尺读数（m） */
+  downStageM?: number | null
+  /** 比降观测时刻（ISO 字符串）：一趟测流记下的上、下游比降水尺读数时刻 */
+  slopeObservedAt?: string | null
   createdAt: number
   updatedAt: number
 }

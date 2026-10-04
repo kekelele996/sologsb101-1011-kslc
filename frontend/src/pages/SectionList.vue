@@ -14,13 +14,16 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useSlopeStore } from '@/stores/slopeStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import { calcFallM } from '@/types/slope'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const slopeStore = useSlopeStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -33,7 +36,10 @@ const form = reactive({
   startDistanceM: 0,
   stageM: 0,
   method: '流速仪' as MeasureMethod,
-  measuredAt: new Date().toISOString().slice(0, 16)
+  measuredAt: new Date().toISOString().slice(0, 16),
+  upStageM: null as number | null,
+  downStageM: null as number | null,
+  slopeObservedAt: ''
 })
 
 const sectionRows = computed(() => {
@@ -82,6 +88,9 @@ function openCreate(): void {
   form.stageM = stats.value.latest?.stageM ?? 0
   form.method = '流速仪'
   form.measuredAt = new Date().toISOString().slice(0, 16)
+  form.upStageM = null
+  form.downStageM = null
+  form.slopeObservedAt = ''
   dialogVisible.value = true
 }
 
@@ -92,6 +101,9 @@ function openEdit(section: Section): void {
   form.stageM = section.stageM
   form.method = section.method
   form.measuredAt = section.measuredAt.slice(0, 16)
+  form.upStageM = section.upStageM ?? null
+  form.downStageM = section.downStageM ?? null
+  form.slopeObservedAt = section.slopeObservedAt ? section.slopeObservedAt.slice(0, 16) : ''
   dialogVisible.value = true
 }
 
@@ -120,10 +132,15 @@ async function submitForm(): Promise<void> {
       startDistanceM: form.startDistanceM,
       stageM: form.stageM,
       method: form.method,
-      measuredAt: new Date(form.measuredAt).toISOString()
+      measuredAt: new Date(form.measuredAt).toISOString(),
+      upStageM: form.upStageM,
+      downStageM: form.downStageM,
+      slopeObservedAt: form.slopeObservedAt ? new Date(form.slopeObservedAt).toISOString() : null
     }
     if (editingId.value) {
       await sectionStore.updateSection(editingId.value, payload)
+      // 比降读数改动后同步刷新匹配该测次的点据落差
+      await slopeStore.refreshSectionFalls(editingId.value)
       ElMessage.success('测次已更新')
     } else {
       const created = await sectionStore.createSection(payload)
@@ -153,6 +170,11 @@ async function removeSection(section: Section): Promise<void> {
 function gotoVerticals(section: Section): void {
   sectionStore.selectSection(section.id)
   void router.push(`/sections/${section.id}/verticals`)
+}
+
+/** 测次落差（上比降水尺 − 下比降水尺），无比降读数返回 null */
+function fallOf(section: Section): number | null {
+  return calcFallM(section.upStageM, section.downStageM)
 }
 
 function handleFilterChange(): void {
@@ -303,6 +325,12 @@ onMounted(() => {
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="比降 (m)" width="110" align="right">
+          <template #default="{ row }">
+            <span v-if="fallOf(row) !== null" class="gb-mono">{{ fallOf(row)?.toFixed(2) }}</span>
+            <span v-else class="gb-hint">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
@@ -341,6 +369,17 @@ onMounted(() => {
         </el-form-item>
         <el-form-item label="测流时间" required>
           <el-date-picker v-model="form.measuredAt" type="datetime" placeholder="选择测流时间" value-format="YYYY-MM-DDTHH:mm" />
+        </el-form-item>
+        <el-form-item label="上比降水尺">
+          <el-input-number v-model="form.upStageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" placeholder="可选" />
+          <span class="page__unit">m</span>
+        </el-form-item>
+        <el-form-item label="下比降水尺">
+          <el-input-number v-model="form.downStageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" placeholder="可选" />
+          <span class="page__unit">m</span>
+        </el-form-item>
+        <el-form-item label="比降时刻">
+          <el-date-picker v-model="form.slopeObservedAt" type="datetime" placeholder="选择比降观测时刻" value-format="YYYY-MM-DDTHH:mm" />
         </el-form-item>
       </el-form>
       <template #footer>

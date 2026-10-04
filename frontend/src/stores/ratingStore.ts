@@ -50,11 +50,11 @@ export const useRatingStore = defineStore('rating', () => {
   const stationNameOf = (stationId: string): string =>
     stations.value.find((station) => station.id === stationId)?.name ?? '未知测站'
 
-  /** 逐定线号的拟合结果（幂函数定线） */
+  /** 逐定线号的拟合结果（幂函数定线）；待复核点据不参与定线 */
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
       const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
+        .filter((rating) => rating.lineNo === lineNo && !rating.pendingReview)
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
       return fitPowerCurve(points, lineNo)
     })
@@ -68,10 +68,10 @@ export const useRatingStore = defineStore('rating', () => {
     return fitPowerCurve([], activeLineNo.value)
   })
 
-  /** 点据 + 曲线流量 + 残差 */
+  /** 点据 + 曲线流量 + 残差；待复核点据不参与定线与残差 */
   const pointRows = computed(() =>
     ratings.value
-      .filter((rating) => rating.lineNo === activeLineNo.value)
+      .filter((rating) => rating.lineNo === activeLineNo.value && !rating.pendingReview)
       .sort((a, b) => a.stageM - b.stageM)
       .map((rating) => {
         const predicted = activeFit.value.valid ? curveFlow(activeFit.value, rating.stageM) : 0
@@ -128,6 +128,11 @@ export const useRatingStore = defineStore('rating', () => {
     compareRows.value.filter((row) => row.compare.verdict === '超限')
   )
 
+  /** 待复核点据：比降观测改动或撤掉后失效、退回资料室重算的点据，不参与定线 */
+  const pendingReviewRows = computed<Rating[]>(() =>
+    ratings.value.filter((rating) => rating.pendingReview)
+  )
+
   /** 定线质量派生值：平均残差与合格点占比 */
   const fitQuality = computed(() => {
     const valid = allFits.value.filter((fit) => fit.valid)
@@ -170,7 +175,15 @@ export const useRatingStore = defineStore('rating', () => {
     payload: Omit<Rating, 'id' | 'createdAt' | 'updatedAt'>
   ): Promise<Rating> {
     const now = Date.now()
-    const row: Rating = { ...payload, id: createId('rat'), createdAt: now, updatedAt: now }
+    const row: Rating = {
+      ...payload,
+      // 未显式给定时，实测流量即参与定线流量；待复核默认 false
+      measuredFlowM3s: payload.measuredFlowM3s ?? payload.flowM3s,
+      pendingReview: payload.pendingReview ?? false,
+      id: createId('rat'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.ratings.put(row)
     return row
   }
@@ -194,12 +207,12 @@ export const useRatingStore = defineStore('rating', () => {
     const targetLine = lineNo ?? activeLineNo.value
     const fit = fitPowerCurve(
       ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
+        .filter((rating) => rating.lineNo === targetLine && !rating.pendingReview)
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
       targetLine
     )
     setFit(fit)
-    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
+    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine && !rating.pendingReview)
     if (targets.length === 0) return 0
     const now = Date.now()
     const rows: Compare[] = targets.map((rating) => {
@@ -271,6 +284,7 @@ export const useRatingStore = defineStore('rating', () => {
     hasFilter,
     compareRows,
     overLimitRows,
+    pendingReviewRows,
     fitQuality,
     start,
     stationNameOf,

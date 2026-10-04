@@ -20,6 +20,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '断面测次', icon: 'Files' }
   },
   {
+    path: '/stations/:id/slope',
+    name: 'slope-observation',
+    component: () => import('@/pages/SlopeObservation.vue'),
+    meta: { title: '比降观测', icon: 'Odometer' }
+  },
+  {
     path: '/sections/:id/verticals',
     name: 'vertical-board',
     component: () => import('@/pages/VerticalBoard.vue'),
