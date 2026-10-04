@@ -6,21 +6,28 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Right, Timer } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Right, ScaleToOriginal, Timer } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
+import SlopeObsDialog from '@/components/common/SlopeObsDialog.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useSlopeStore } from '@/stores/slopeStore'
+import { useRatingStore } from '@/stores/ratingStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import type { SlopeObservation } from '@/types/slope'
+import { calcFallM } from '@/types/slope'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const slopeStore = useSlopeStore()
+const ratingStore = useRatingStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -153,6 +160,42 @@ async function removeSection(section: Section): Promise<void> {
 function gotoVerticals(section: Section): void {
   sectionStore.selectSection(section.id)
   void router.push(`/sections/${section.id}/verticals`)
+}
+
+/* ------------------------------ 往返比降 ------------------------------ */
+
+const slopeDialogVisible = ref(false)
+const slopePresetSection = ref<Section | null>(null)
+
+/** 某测次已补记的比降观测（按测次号或断面 id 关联） */
+function slopeOfSection(section: Section): SlopeObservation | null {
+  return (
+    slopeStore.observations.find((obs) => obs.sectionId === section.id) ??
+      slopeStore.observations.find((obs) => obs.measureNo && obs.measureNo === section.measureNo) ??
+      null
+  )
+}
+
+function openSlopeDialog(section: Section): void {
+  slopePresetSection.value = section
+  slopeDialogVisible.value = true
+}
+
+async function handleSlopeSubmit(payload: {
+  stationId: string
+  sectionId: string | null
+  measureNo: string
+  upstreamGaugeM: number
+  downstreamGaugeM: number
+  gaugeDistanceM: number
+  observedAt: string
+  trend: SlopeObservation['trend']
+  remark: string
+}): Promise<void> {
+  await slopeStore.createObservation(payload)
+  const linked = await slopeStore.autoLinkPending()
+  await ratingStore.rebuildCompares()
+  ElMessage.success(linked > 0 ? `往返比降已补记，并回填 ${linked} 个待挂接点据` : '往返比降已补记')
 }
 
 function handleFilterChange(): void {
@@ -303,9 +346,23 @@ onMounted(() => {
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="往返比降" min-width="170">
+          <template #default="{ row }">
+            <template v-if="slopeOfSection(row)">
+              <el-tag size="small" :type="slopeOfSection(row)?.trend === '涨水' ? 'danger' : slopeOfSection(row)?.trend === '落水' ? 'warning' : 'info'" effect="plain">
+                {{ slopeOfSection(row)?.trend }}
+              </el-tag>
+              <span class="gb-mono gb-hint">{{ calcFallM(slopeOfSection(row)!).toFixed(3) }} m</span>
+            </template>
+            <el-button v-else size="small" text type="primary" :icon="ScaleToOriginal" @click="openSlopeDialog(row)">
+              补记比降
+            </el-button>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
+            <el-button size="small" :icon="ScaleToOriginal" @click="openSlopeDialog(row)">比降</el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeSection(row)">删除</el-button>
           </template>
@@ -317,7 +374,8 @@ onMounted(() => {
 
       <p class="gb-hint">
         <el-icon><Timer /></el-icon>
-        提示：测次的水位将参与水位流量关系点据定线；同一测次下的垂线按起点距升序参与部分面积法流量计算。
+        提示：测次的水位将参与水位流量关系点据定线；巡测班可在测次上补记往返比降水尺读数与时刻，供资料室做落差改正；
+        同一测次下的垂线按起点距升序参与部分面积法流量计算。
       </p>
     </template>
 
@@ -350,6 +408,14 @@ onMounted(() => {
         </el-button>
       </template>
     </el-dialog>
+
+    <SlopeObsDialog
+      v-model="slopeDialogVisible"
+      :stations="stationStore.stations"
+      :preset-station-id="stationId"
+      :preset-section="slopePresetSection"
+      @submit="handleSlopeSubmit"
+    />
   </section>
 </template>
 

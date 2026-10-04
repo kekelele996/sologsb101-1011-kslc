@@ -21,6 +21,7 @@ app.use(ElementPlus, { locale: zhCn })
 
 app.mount('#app')
 
-// 首屏打开数据库并幂等播种演示数据（测站 → 断面 → 垂线 → 测点 → 点据 → 比测），
+// 首屏打开数据库并幂等播种演示数据
+// （测站 → 断面 → 垂线 → 测点 → 点据 → 比测，另有比降观测支撑落差改正），
 // 播种完成后 store 的 liveQuery 订阅会自动把数据推到页面。
 void initDatabase()

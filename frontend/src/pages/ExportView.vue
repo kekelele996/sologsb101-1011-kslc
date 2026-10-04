@@ -13,6 +13,8 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useSlopeStore } from '@/stores/slopeStore'
+import CorrectionStatusTag from '@/components/common/CorrectionStatusTag.vue'
 import {
   DB_NAME,
   DB_VERSION,
@@ -32,11 +34,12 @@ import {
   remapIds,
   validateBackup
 } from '@/utils/export'
-import { fitPowerCurve } from '@/types/rating'
+import { fitPowerCurve, fitablePoints } from '@/types/rating'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const slopeStore = useSlopeStore()
 
 const counts = ref<Record<string, number>>({})
 const lastBackupAt = ref<string | null>(null)
@@ -73,9 +76,7 @@ async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
   const fits = ratingStore.lineNos.map((lineNo) =>
     fitPowerCurve(
-      payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+      fitablePoints(payload.ratings.filter((rating) => rating.lineNo === lineNo)),
       lineNo
     )
   )
@@ -253,6 +254,12 @@ onMounted(() => {
             <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="改正状态" width="100" align="center">
+          <template #default="{ row }">
+            <CorrectionStatusTag v-if="row.rating" :status="row.rating.correctionStatus" size="small" />
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating ? row.rating.stageM.toFixed(2) : '—' }}</span>
@@ -290,7 +297,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / slopeObservations 七张表
         </span>
       </div>
 
@@ -334,6 +341,7 @@ onMounted(() => {
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
         </el-descriptions-item>
+        <el-descriptions-item label="比降观测">{{ counts.slopeObservations ?? 0 }} 次</el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>

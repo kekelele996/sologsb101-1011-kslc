@@ -121,11 +121,11 @@ export const useStationStore = defineStore('station', () => {
     await db.stations.update(id, { ...patch, updatedAt: Date.now() } as never)
   }
 
-  /** 删除测站：级联删除其断面、垂线、测点、点据与比测记录 */
+  /** 删除测站：级联删除其断面、垂线、测点、点据、比测记录与比降观测 */
   async function removeStation(id: string): Promise<void> {
     await db.transaction(
       'rw',
-      [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+      [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.slopeObservations],
       async () => {
         const sectionIds = (await db.sections.where('stationId').equals(id).toArray()).map((row) => row.id)
         const verticalIds =
@@ -144,6 +144,7 @@ export const useStationStore = defineStore('station', () => {
           await db.compares.where('ratingId').anyOf(ratingIds).delete()
           await db.ratings.where('stationId').equals(id).delete()
         }
+        await db.slopeObservations.where('stationId').equals(id).delete()
         await db.stations.delete(id)
       }
     )

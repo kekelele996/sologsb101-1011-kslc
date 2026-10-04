@@ -8,12 +8,22 @@ import {
   DB_VERSION,
   createId,
   clearAllTables,
+  normalizeRating,
   stampBackupTime,
+  backfillRatingSlopeLinks,
   type BackupPayload
 } from '@/utils/db'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = [
+  'stations',
+  'sections',
+  'verticals',
+  'points',
+  'ratings',
+  'compares',
+  'slopeObservations'
+] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,13 +31,14 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, slopeObservations] = await Promise.all([
     db.stations.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
     db.ratings.toArray(),
-    db.compares.toArray()
+    db.compares.toArray(),
+    db.slopeObservations.toArray()
   ])
   return {
     app: 'gbhydrogaug',
@@ -38,7 +49,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    slopeObservations
   }
 }
 
@@ -52,7 +64,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== 'gbhydrogaug' && obj.app !== undefined) {
     errors.push('app 字段应为 gbhydrogaug，文件来源不明')
   }
+  // 比降观测为 v3 新增表：旧备份可没有，按空数组处理
   for (const key of BACKUP_KEYS) {
+    if (key === 'slopeObservations') continue
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -65,7 +79,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    slopeObservations: Array.isArray(obj.slopeObservations) ? obj.slopeObservations : []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +93,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    slopeObservations: payload.slopeObservations.length
   }
 }
 
@@ -111,22 +127,30 @@ export function readFileText(file: File): Promise<string> {
   })
 }
 
-/** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
+/**
+ * 导入快照：overwrite=true 先清空全部表，否则按主键合并。
+ * 旧备份点据没有比降归属，先归一化（缺省置待挂接），再按测次时间回填。
+ */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
+  const ratings = payload.ratings.map((rating) => normalizeRating(rating))
+  const normalized: BackupPayload = { ...payload, ratings }
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.slopeObservations],
     async () => {
-      await db.stations.bulkPut(payload.stations)
-      await db.sections.bulkPut(payload.sections)
-      await db.verticals.bulkPut(payload.verticals)
-      await db.points.bulkPut(payload.points)
-      await db.ratings.bulkPut(payload.ratings)
-      await db.compares.bulkPut(payload.compares)
+      await db.stations.bulkPut(normalized.stations)
+      await db.sections.bulkPut(normalized.sections)
+      await db.verticals.bulkPut(normalized.verticals)
+      await db.points.bulkPut(normalized.points)
+      await db.ratings.bulkPut(normalized.ratings)
+      await db.compares.bulkPut(normalized.compares)
+      await db.slopeObservations.bulkPut(normalized.slopeObservations)
     }
   )
-  return countPayload(payload)
+  // 旧点据按测次时间回填比降归属，对不上的先挂着
+  await backfillRatingSlopeLinks()
+  return countPayload(normalized)
 }
 
 /** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
@@ -135,6 +159,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const sectionMap = new Map<string, string>()
   const verticalMap = new Map<string, string>()
   const ratingMap = new Map<string, string>()
+  const slopeMap = new Map<string, string>()
 
   const stations = payload.stations.map((station) => {
     const id = createId('stn')
@@ -156,17 +181,32 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('pnt'),
     verticalId: verticalMap.get(point.verticalId) ?? point.verticalId
   }))
+  const slopeObservations = payload.slopeObservations.map((obs) => {
+    const id = createId('slp')
+    slopeMap.set(obs.id, id)
+    return {
+      ...obs,
+      id,
+      stationId: stationMap.get(obs.stationId) ?? obs.stationId,
+      sectionId: obs.sectionId ? sectionMap.get(obs.sectionId) ?? null : null
+    }
+  })
   const ratings = payload.ratings.map((rating) => {
     const id = createId('rat')
     ratingMap.set(rating.id, id)
-    return { ...rating, id, stationId: stationMap.get(rating.stationId) ?? rating.stationId }
+    return {
+      ...rating,
+      id,
+      stationId: stationMap.get(rating.stationId) ?? rating.stationId,
+      slopeObsId: rating.slopeObsId ? slopeMap.get(rating.slopeObsId) ?? null : null
+    }
   })
   const compares = payload.compares.map((compare) => ({
     ...compare,
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  return { ...payload, stations, sections, verticals, points, ratings, compares, slopeObservations }
 }
 
 /**

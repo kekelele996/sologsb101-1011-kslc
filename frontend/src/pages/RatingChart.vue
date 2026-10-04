@@ -6,25 +6,31 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Refresh, TrendCharts } from '@element-plus/icons-vue'
+import { Delete, Edit, MagicStick, Plus, Refresh, TrendCharts } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
 import DeviationTag from '@/components/common/DeviationTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
+import CorrectionStatusTag from '@/components/common/CorrectionStatusTag.vue'
+import CorrectionDialog from '@/components/common/CorrectionDialog.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
-import { fitPowerCurve, type Rating, type RatingFitResult } from '@/types/rating'
+import { useSlopeStore } from '@/stores/slopeStore'
+import { fitPowerCurve, effectiveFlow, isFitableRating, type Rating, type RatingFitResult } from '@/types/rating'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
+const slopeStore = useSlopeStore()
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
 const submitting = ref(false)
+const correctionVisible = ref(false)
+const correctionTargets = ref<Rating[]>([])
 const form = reactive({
   stationId: '',
   stageM: 0,
@@ -37,16 +43,19 @@ const form = reactive({
 const fit = computed(() => ratingStore.activeFit)
 const lineNos = computed(() => (ratingStore.lineNos.length > 0 ? ratingStore.lineNos : ['A']))
 
-/** 当前定线号下的点据（含曲线流量与残差） */
+/** 当前定线号下的点据（含曲线流量与残差；待挂接点据不参与定线） */
 const pointRows = computed(() =>
   ratingStore.ratings
     .filter((rating) => rating.lineNo === ratingStore.activeLineNo)
     .sort((a, b) => a.stageM - b.stageM)
     .map((rating) => {
-      const predicted = fit.value.valid ? Number((fit.value.a * Math.pow(Math.max(rating.stageM - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
+      const flow = effectiveFlow(rating)
+      const eligible = isFitableRating(rating)
+      const predicted =
+        fit.value.valid && eligible ? Number((fit.value.a * Math.pow(Math.max(rating.stageM - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
       const residualPct =
-        fit.value.valid && rating.flowM3s > 0
-          ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
+        fit.value.valid && eligible && flow > 0
+          ? Number((((flow - predicted) / flow) * 100).toFixed(2))
           : 0
       const compare = ratingStore.compares.find((item) => item.ratingId === rating.id)
       return {
@@ -54,7 +63,11 @@ const pointRows = computed(() =>
         stationName: ratingStore.stationNameOf(rating.stationId),
         predicted,
         residualPct,
-        verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
+        eligible,
+        linked: !!slopeStore.obsById(rating.slopeObsId),
+        verdict: !eligible
+          ? '超限'
+          : compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
       }
     })
 )
@@ -70,10 +83,10 @@ const filterModel = computed<FilterModel>(() => ({
 const chart = computed(() => {
   const rows = pointRows.value
   if (rows.length === 0) {
-    return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; verdict: string }>, stageMin: 0, stageMax: 0, flowMax: 0 }
+    return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; verdict: string; eligible: boolean }>, stageMin: 0, stageMax: 0, flowMax: 0 }
   }
   const stages = rows.map((row) => row.rating.stageM)
-  const flows = rows.map((row) => row.rating.flowM3s)
+  const flows = rows.map((row) => effectiveFlow(row.rating))
   const stageMin = Math.min(...stages)
   const stageMax = Math.max(...stages)
   const flowMax = Math.max(...flows) * 1.1
@@ -95,7 +108,8 @@ const chart = computed(() => {
     points: rows.map((row) => ({
       id: row.rating.id,
       cx: toX(row.rating.stageM),
-      cy: toY(row.rating.flowM3s),
+      cy: toY(effectiveFlow(row.rating)),
+      eligible: row.eligible,
       verdict: row.verdict
     })),
     stageMin,
@@ -146,15 +160,29 @@ async function submitForm(): Promise<void> {
       stationId: form.stationId,
       stageM: form.stageM,
       flowM3s: form.flowM3s,
+      rawFlowM3s: form.flowM3s,
       lineNo: form.lineNo.trim() || 'A',
       measureNo: form.measureNo.trim(),
-      measuredAt: form.measuredAt ? new Date(form.measuredAt).toISOString() : new Date().toISOString()
+      measuredAt: form.measuredAt ? new Date(form.measuredAt).toISOString() : new Date().toISOString(),
+      correctionStatus: '未改正' as const,
+      slopeObsId: null,
+      baseFallM: null,
+      fallBeta: null,
+      correctionNote: ''
     }
     if (editingId.value) {
-      await ratingStore.updateRating(editingId.value, payload)
+      // 编辑不覆盖改正字段：改正态点据的流量以改正链路为准，改正请走比降改正页
+      await ratingStore.updateRating(editingId.value, {
+        stationId: payload.stationId,
+        stageM: payload.stageM,
+        lineNo: payload.lineNo,
+        measureNo: payload.measureNo,
+        measuredAt: payload.measuredAt
+      })
       ElMessage.success('点据已更新')
     } else {
-      await ratingStore.createRating(payload)
+      const created = await ratingStore.createRating(payload)
+      await slopeStore.autoLinkRatingOnCreate(created)
       ElMessage.success('点据已新增，正在重算定线')
     }
     ratingStore.setActiveLine(payload.lineNo)
@@ -182,7 +210,9 @@ async function removeRating(rating: Rating): Promise<void> {
 
 async function refit(): Promise<void> {
   const result: RatingFitResult = fitPowerCurve(
-    pointRows.value.map((row) => ({ stageM: row.rating.stageM, flowM3s: row.rating.flowM3s })),
+    pointRows.value
+      .filter((row) => row.eligible)
+      .map((row) => ({ stageM: row.rating.stageM, flowM3s: effectiveFlow(row.rating) })),
     ratingStore.activeLineNo
   )
   ratingStore.setFit(result)
@@ -199,6 +229,49 @@ async function refit(): Promise<void> {
 function handleLineChange(lineNo: string | number | boolean | undefined): void {
   ratingStore.setActiveLine(String(lineNo))
   void ratingStore.rebuildCompares(String(lineNo))
+}
+
+/** 待挂接点据整行置灰（视觉提示其不参与定线） */
+function tableRowClass(data: { row: (typeof pointRows.value)[number] }): string {
+  return data.row.eligible ? '' : 'gb-row-muted'
+}
+
+/** 打开单个点据的落差改正（需已挂接比降观测） */
+function openCorrection(row: (typeof pointRows.value)[number]): void {
+  if (!row.linked) {
+    ElMessage.warning('该点据尚无比降归属，请先到「比降改正」页按测次时间核对归属')
+    return
+  }
+  correctionTargets.value = [row.rating]
+  correctionVisible.value = true
+}
+
+/** 当前定线内可批量改正的点据（已挂接、非已改正） */
+function openLineCorrection(): void {
+  const targets = pointRows.value
+    .filter((row) => row.linked && row.rating.correctionStatus !== '已改正')
+    .map((row) => row.rating)
+  if (targets.length === 0) {
+    ElMessage.warning('当前定线没有可改正的已挂接点据')
+    return
+  }
+  correctionTargets.value = targets
+  correctionVisible.value = true
+}
+
+async function handleCorrectionApply(payload: {
+  ratingIds: string[]
+  baseFallM: number
+  beta: number
+  note: string
+}): Promise<void> {
+  const done = await slopeStore.applyCorrections(payload.ratingIds, {
+    baseFallM: payload.baseFallM,
+    beta: payload.beta,
+    note: payload.note
+  })
+  await ratingStore.rebuildCompares(ratingStore.activeLineNo)
+  ElMessage.success(`已改正 ${done} 个点据并重新定线`)
 }
 
 function handleFilterChange(): void {
@@ -241,7 +314,8 @@ onMounted(() => {
       <div>
         <h2 class="page__title">水位流量关系点据与定线</h2>
         <p class="gb-hint">
-          点据按定线号分组做幂函数拟合 Q = a×(H-H0)^b，残差超过 {{ ratingStore.deviationLimitPct }}% 的点据自动挂红并进入比测分析清单。
+          点据按定线号分组做幂函数拟合 Q = a×(H-H0)^b；比降改正后的稳定流流量参与定线，
+          残差超过 {{ ratingStore.deviationLimitPct }}% 的点据自动挂红并进入比测分析清单；待挂接旧点据不参与定线。
         </p>
       </div>
       <div class="page__actions">
@@ -253,6 +327,7 @@ onMounted(() => {
           <el-option v-for="lineNo in lineNos" :key="lineNo" :label="`${lineNo} 线`" :value="lineNo" />
         </el-select>
         <el-button :icon="Refresh" @click="refit">重新定线</el-button>
+        <el-button :icon="MagicStick" @click="openLineCorrection">比降改正</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate">新增点据</el-button>
       </div>
     </div>
@@ -329,40 +404,52 @@ onMounted(() => {
         @action="openCreate"
       />
 
-      <el-table v-else :data="pointRows" border stripe class="gb-table-compact">
-        <el-table-column label="水位 (m)" width="110" align="right">
+      <el-table v-else :data="pointRows" border stripe class="gb-table-compact" :row-class-name="tableRowClass">
+        <el-table-column label="水位 (m)" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.stageM.toFixed(2) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实测流量 (m³/s)" width="150" align="right">
+        <el-table-column label="实测流量" width="110" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.rating.flowM3s.toFixed(1) }}</span>
+            <span class="gb-mono">{{ row.rating.rawFlowM3s.toFixed(1) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="曲线流量 (m³/s)" width="150" align="right">
+        <el-table-column label="定线流量" width="110" align="right">
+          <template #default="{ row }">
+            <b class="gb-mono">{{ effectiveFlow(row.rating).toFixed(1) }}</b>
+          </template>
+        </el-table-column>
+        <el-table-column label="曲线流量" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.predicted > 0 ? row.predicted.toFixed(1) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="残差" width="200">
+        <el-table-column label="改正状态" width="100" align="center">
           <template #default="{ row }">
-            <DeviationTag :deviation-pct="row.residualPct" :verdict="row.verdict" :limit="ratingStore.deviationLimitPct" />
+            <CorrectionStatusTag :status="row.rating.correctionStatus" size="small" />
           </template>
         </el-table-column>
-        <el-table-column label="测站 / 测次" min-width="180">
+        <el-table-column label="残差" width="190">
+          <template #default="{ row }">
+            <DeviationTag v-if="row.eligible" :deviation-pct="row.residualPct" :verdict="row.verdict" :limit="ratingStore.deviationLimitPct" />
+            <el-tag v-else size="small" type="info" effect="plain">挂起不参与</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="测站 / 测次" min-width="170">
           <template #default="{ row }">
             <div>{{ row.stationName }}</div>
             <div class="gb-hint gb-mono">{{ row.rating.measureNo || '未标记测次' }}</div>
           </template>
         </el-table-column>
-        <el-table-column label="点据时间" width="170">
+        <el-table-column label="点据时间" width="160">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.rating.measuredAt).toLocaleDateString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
+            <el-button size="small" type="primary" plain :icon="MagicStick" @click="openCorrection(row)">改正</el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row.rating)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeRating(row.rating)">删除</el-button>
           </template>
@@ -388,12 +475,12 @@ onMounted(() => {
             :cx="point.cx"
             :cy="point.cy"
             r="4.5"
-            :fill="point.verdict === '超限' ? '#c0392b' : '#7fd1e8'"
-            :stroke="point.verdict === '超限' ? '#7b241c' : '#0f4c75'"
+            :fill="!point.eligible ? '#c7d0d8' : point.verdict === '超限' ? '#c0392b' : '#7fd1e8'"
+            :stroke="!point.eligible ? '#8aa0ae' : point.verdict === '超限' ? '#7b241c' : '#0f4c75'"
           />
         </svg>
         <EmptyPanel v-else title="暂无可绘制的点据" description="录入点据后自动生成关系曲线。" compact />
-        <p class="gb-hint">红点表示残差超限的点据，曲线为幂函数定线成果。</p>
+        <p class="gb-hint">红点为残差超限，灰点为待挂接（不参与定线），蓝点为合格；曲线为幂函数定线成果。</p>
       </el-card>
     </div>
 
@@ -412,8 +499,9 @@ onMounted(() => {
           <span class="page__unit">m</span>
         </el-form-item>
         <el-form-item label="流量" required>
-          <el-input-number v-model="form.flowM3s" :min="0.01" :max="100000" :step="1" :precision="1" controls-position="right" />
+          <el-input-number v-model="form.flowM3s" :min="0.01" :max="100000" :step="1" :precision="1" :disabled="!!editingId" controls-position="right" />
           <span class="page__unit">m³/s</span>
+          <span v-if="editingId" class="gb-hint">改正流量请到「比降改正」处理</span>
         </el-form-item>
         <el-form-item label="测次号">
           <el-input v-model="form.measureNo" placeholder="如：2024-06-001" maxlength="32" />
@@ -429,6 +517,8 @@ onMounted(() => {
         </el-button>
       </template>
     </el-dialog>
+
+    <CorrectionDialog v-model="correctionVisible" :ratings="correctionTargets" @apply="handleCorrectionApply" />
   </section>
 </template>
 
@@ -493,5 +583,10 @@ onMounted(() => {
   .page__grid {
     grid-template-columns: 1fr;
   }
+}
+
+:deep(.gb-row-muted) {
+  color: #93a3af;
+  background-color: #f6f8fa;
 }
 </style>

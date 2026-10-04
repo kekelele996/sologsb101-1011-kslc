@@ -1,3 +1,5 @@
+import type { CorrectionStatus } from './slope'
+
 /** 水位流量关系点据：参与幂函数定线的实测点 */
 export interface Rating {
   id: string
@@ -5,16 +7,46 @@ export interface Rating {
   stationId: string
   /** 水位（m） */
   stageM: number
-  /** 流量（m³/s） */
+  /** 流量（m³/s）：改正后为稳定流流量，未改正时等于实测流量 */
   flowM3s: number
+  /** 实测流量（m³/s）：比降改正前的原始实测值，未改正时与 flowM3s 相同 */
+  rawFlowM3s: number
   /** 定线号：同一定线号的点据参与同一组拟合 */
   lineNo: string
   /** 点据来源测次号 */
   measureNo: string
   /** 点据时间 */
   measuredAt: string
+  /** 比降改正状态 */
+  correctionStatus: CorrectionStatus
+  /** 归属比降观测 id（待挂接时为空） */
+  slopeObsId: string | null
+  /** 改正所用基准落差 Zk（m） */
+  baseFallM: number | null
+  /** 改正所用落差指数 β */
+  fallBeta: number | null
+  /** 改正备注 / 失效原因（退回待复核时记录） */
+  correctionNote: string
   createdAt: number
   updatedAt: number
+}
+
+/** 点据用于定线的有效流量：已改正 / 待复核用改正值，未改正用实测值 */
+export function effectiveFlow(rating: Pick<Rating, 'flowM3s' | 'rawFlowM3s'>): number {
+  return rating.flowM3s > 0 ? rating.flowM3s : rating.rawFlowM3s
+}
+
+/**
+ * 可参与定线的点据：「待挂接」的旧点据先挂着，不参与定线；
+ * 其余状态（含退回待复核）均以当前有效流量参与，便于资料室发现异常。
+ */
+export function isFitableRating(rating: Pick<Rating, 'correctionStatus'>): boolean {
+  return rating.correctionStatus !== '待挂接'
+}
+
+/** 点据的定线拟合输入（水位 + 有效流量） */
+export function fitablePoints(ratings: Rating[]): Array<{ stageM: number; flowM3s: number }> {
+  return ratings.filter(isFitableRating).map((rating) => ({ stageM: rating.stageM, flowM3s: effectiveFlow(rating) }))
 }
 
 /** 幂函数定线结果：Q = a * (H - H0)^b */

@@ -8,7 +8,10 @@ import { useRatingStore } from '@/stores/ratingStore'
 import type { Compare } from '@/types/compare'
 import {
   curveFlow,
+  effectiveFlow,
+  fitablePoints,
   fitPowerCurve,
+  isFitableRating,
   type Rating,
   type RatingFitResult
 } from '@/types/rating'
@@ -76,9 +79,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
-      const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+      const points = fitablePoints(ratings.value.filter((rating) => rating.lineNo === lineNo))
       return fitPowerCurve(points, lineNo)
     })
   )
@@ -95,10 +96,12 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
       .map((rating) => {
-        const predicted = current.valid ? curveFlow(current, rating.stageM) : 0
+        const flow = effectiveFlow(rating)
+        const eligible = isFitableRating(rating)
+        const predicted = current.valid && eligible ? curveFlow(current, rating.stageM) : 0
         const residualPct =
-          current.valid && rating.flowM3s > 0
-            ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
+          current.valid && eligible && flow > 0
+            ? Number((((flow - predicted) / flow) * 100).toFixed(2))
             : 0
         return {
           rating,
@@ -128,13 +131,12 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
     const limit = ratingStore.deviationLimitPct
     return allFits.value.flatMap((item) =>
       ratings.value
-        .filter((rating) => rating.lineNo === item.lineNo)
+        .filter((rating) => rating.lineNo === item.lineNo && isFitableRating(rating))
         .map((rating) => {
+          const flow = effectiveFlow(rating)
           const predicted = item.valid ? curveFlow(item, rating.stageM) : 0
           const residualPct =
-            item.valid && rating.flowM3s > 0
-              ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
-              : 0
+            item.valid && flow > 0 ? Number((((flow - predicted) / flow) * 100).toFixed(2)) : 0
           return {
             rating,
             stationName: stationNameOf(rating.stationId),
@@ -156,9 +158,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   }
 
   function refit(): RatingFitResult {
-    const points = ratings.value
-      .filter((rating) => rating.lineNo === activeLineNo.value)
-      .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+    const points = fitablePoints(ratings.value.filter((rating) => rating.lineNo === activeLineNo.value))
     const result = fitPowerCurve(points, activeLineNo.value)
     ratingStore.setFit(result)
     return result

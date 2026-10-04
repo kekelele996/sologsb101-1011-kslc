@@ -8,7 +8,15 @@ import { db, createId, watchTable } from '@/utils/db'
 import type { Compare } from '@/types/compare'
 import { DEVIATION_LIMIT_PCT, calcDeviationPct, judgeDeviation, type CompareRow } from '@/types/compare'
 import type { Rating, RatingFitResult } from '@/types/rating'
-import { createEmptyRatingFilter, curveFlow, fitPowerCurve, type RatingFilterState } from '@/types/rating'
+import {
+  createEmptyRatingFilter,
+  curveFlow,
+  effectiveFlow,
+  fitablePoints,
+  fitPowerCurve,
+  isFitableRating,
+  type RatingFilterState
+} from '@/types/rating'
 import type { Station } from '@/types/station'
 
 export const useRatingStore = defineStore('rating', () => {
@@ -50,12 +58,10 @@ export const useRatingStore = defineStore('rating', () => {
   const stationNameOf = (stationId: string): string =>
     stations.value.find((station) => station.id === stationId)?.name ?? '未知测站'
 
-  /** 逐定线号的拟合结果（幂函数定线） */
+  /** 逐定线号的拟合结果（幂函数定线，待挂接旧点据不参与） */
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
-      const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+      const points = fitablePoints(ratings.value.filter((rating) => rating.lineNo === lineNo))
       return fitPowerCurve(points, lineNo)
     })
   )
@@ -68,16 +74,18 @@ export const useRatingStore = defineStore('rating', () => {
     return fitPowerCurve([], activeLineNo.value)
   })
 
-  /** 点据 + 曲线流量 + 残差 */
+  /** 点据 + 曲线流量 + 残差（流量取改正后的有效流量） */
   const pointRows = computed(() =>
     ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
       .map((rating) => {
-        const predicted = activeFit.value.valid ? curveFlow(activeFit.value, rating.stageM) : 0
+        const flow = effectiveFlow(rating)
+        const eligible = isFitableRating(rating)
+        const predicted = activeFit.value.valid && eligible ? curveFlow(activeFit.value, rating.stageM) : 0
         const residualPct =
-          activeFit.value.valid && rating.flowM3s > 0
-            ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
+          activeFit.value.valid && eligible && flow > 0
+            ? Number((((flow - predicted) / flow) * 100).toFixed(2))
             : 0
         return { rating, predicted, residualPct }
       })
@@ -174,7 +182,6 @@ export const useRatingStore = defineStore('rating', () => {
     await db.ratings.put(row)
     return row
   }
-
   async function updateRating(id: string, patch: Partial<Rating>): Promise<void> {
     await db.ratings.update(id, { ...patch, updatedAt: Date.now() } as never)
   }
@@ -187,15 +194,13 @@ export const useRatingStore = defineStore('rating', () => {
   }
 
   /**
-   * 由点据生成 / 刷新比测记录：曲线流量取当前定线拟合值，
-   * 偏差超过限值自动判定超限并进入分析清单。
+   * 由点据生成 / 刷新比测记录：曲线流量取当前定线拟合值（待挂接点据不参与定线），
+   * 实测栏取改正后的有效流量；偏差超过限值自动判定超限并进入分析清单。
    */
   async function rebuildCompares(lineNo?: string): Promise<number> {
     const targetLine = lineNo ?? activeLineNo.value
     const fit = fitPowerCurve(
-      ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+      fitablePoints(ratings.value.filter((rating) => rating.lineNo === targetLine)),
       targetLine
     )
     setFit(fit)
@@ -203,16 +208,17 @@ export const useRatingStore = defineStore('rating', () => {
     if (targets.length === 0) return 0
     const now = Date.now()
     const rows: Compare[] = targets.map((rating) => {
-      const predicted = fit.valid ? curveFlow(fit, rating.stageM) : rating.flowM3s
-      const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
+      const flow = effectiveFlow(rating)
+      const predicted = fit.valid && isFitableRating(rating) ? curveFlow(fit, rating.stageM) : flow
+      const deviationPct = calcDeviationPct(flow, predicted)
       const existing = compares.value.find((item) => item.ratingId === rating.id)
       return {
         id: existing?.id ?? createId('cmp'),
         ratingId: rating.id,
-        measuredFlow: rating.flowM3s,
+        measuredFlow: flow,
         curveFlow: predicted,
         deviationPct,
-        verdict: judgeDeviation(deviationPct, deviationLimitPct.value),
+        verdict: isFitableRating(rating) ? judgeDeviation(deviationPct, deviationLimitPct.value) : '超限',
         operator: existing?.operator ?? '林昭',
         comparedAt: existing?.comparedAt ?? rating.measuredAt,
         createdAt: existing?.createdAt ?? now,

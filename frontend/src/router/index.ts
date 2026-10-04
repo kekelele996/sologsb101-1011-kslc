@@ -38,6 +38,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '水位流量关系点据', icon: 'TrendCharts' }
   },
   {
+    path: '/slopes',
+    name: 'slope-board',
+    component: () => import('@/pages/SlopeBoard.vue'),
+    meta: { title: '比降落差改正', icon: 'ScaleToOriginal' }
+  },
+  {
     path: '/export',
     name: 'export-view',
     component: () => import('@/pages/ExportView.vue'),

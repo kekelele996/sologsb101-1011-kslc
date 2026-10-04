@@ -192,12 +192,14 @@ export const useSectionStore = defineStore('section', () => {
   }
 
   async function removeSection(id: string): Promise<void> {
-    await db.transaction('rw', [db.sections, db.verticals, db.points], async () => {
+    await db.transaction('rw', [db.sections, db.verticals, db.points, db.slopeObservations], async () => {
       const verticalIds = (await db.verticals.where('sectionId').equals(id).toArray()).map((row) => row.id)
       if (verticalIds.length > 0) {
         await db.points.where('verticalId').anyOf(verticalIds).delete()
         await db.verticals.bulkDelete(verticalIds)
       }
+      // 比降水尺读数不动：仅摘除比降观测的断面归属，观测档案本身保留
+      await db.slopeObservations.where('sectionId').equals(id).modify({ sectionId: null })
       await db.sections.delete(id)
     })
   }
